@@ -1,114 +1,66 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
+const { Client, AttachmentBuilder } = require('discord.js');
 const { Chess } = require('chess.js');
-const ChessImageGenerator = require('chess-image-generator');
+const ChGen = require('chess-image-generator');
 const fs = require('fs');
-const csv = require('csv-parser');
+const client = new Client({ intents: [32767] });
+let puz = [], db = JSON.parse(fs.existsSync('./db.json') ? fs.readFileSync('./db.json') : '{}');
+const sessions = new Map(), save = () => fs.writeFileSync('./db.json', JSON.stringify(db));
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
-let puzzles = [], stats = {};
-const games = new Map(), hints = new Map();
-
-// Load Data
-if (fs.existsSync('./stats.json')) stats = JSON.parse(fs.readFileSync('./stats.json'));
-fs.createReadStream('puzzles.csv').pipe(csv()).on('data', r => puzzles.push({
-    fen: r.FEN, solution: r.Moves.split(' '), id: r.PuzzleId, rating: r.Rating
-})).on('end', () => console.log(`Loaded ${puzzles.length} puzzles.`));
-
-const saveStats = () => fs.writeFileSync('./stats.json', JSON.stringify(stats));
-const updateScore = (id, win) => {
-    if (!stats[id]) stats[id] = { wins: 0, losses: 0 };
-    win ? stats[id].wins++ : stats[id].losses++;
-    saveStats();
+require('csv-parser')().on('data', r => puz.push({f:r.FEN, s:r.Moves.split(' '), r:r.Rating}));
+const elo = (wId, lId, draw) => {
+    const s1 = db[wId] ||= {r:1500, w:0, l:0, h:[]}, s2 = db[lId] ||= {r:1500, w:0, l:0, h:[]};
+    const exp = 1 / (1 + 10 ** ((s2.r - s1.r) / 400)), k = 32, sc = draw ? 0.5 : 1;
+    s1.r += k * (sc - exp); s2.r += k * ((1 - sc) - (1 - exp));
+    if(!draw) { s1.w++; s2.l++; s1.h.push('W'); s2.h.push('L'); } save();
 };
 
-// Chess Logic Helpers
-async function sendBoard(channel, game, text, userId) {
-    const ig = new ChessImageGenerator();
-    ig.loadFEN(game.fen());
-    const buf = await ig.generateBuffer();
-    const file = new AttachmentBuilder(buf, { name: 'board.png' });
-    return channel.send({ content: text, files: [file] });
-}
+const draw = async (ch, g, msg) => {
+    const ig = new ChGen({size:400}); ig.loadFEN(g.fen());
+    return ch.send({ content: msg, files: [new AttachmentBuilder(await ig.generateBuffer(), {name:'b.png'})] });
+};
 
-// Bot move selection (Simple evaluation)
-function getBotMove(game) {
-    const moves = game.moves();
-    return moves[Math.floor(Math.random() * moves.length)]; // Expand this with Minimax if desired
-}
+setInterval(() => sessions.forEach((v, k) => (Date.now() - v.t > 1.8e6) && sessions.delete(k)), 6e5);
 
 client.on('messageCreate', async m => {
     if (m.author.bot) return;
-    const args = m.content.toLowerCase().split(' ');
-    const cmd = args[0], userId = m.author.id;
+    const [c, ...a] = m.content.toLowerCase().split(' '), id = m.author.id, s = sessions.get(id);
 
-    // Command: !leaderboard
-    if (cmd === '!leaderboard') {
-        const top = Object.entries(stats).sort((a, b) => b[1].wins - a[1].wins).slice(0, 5)
-            .map(([id, s], i) => `${i + 1}. <@${id}>: ${s.wins}W - ${s.losses}L`).join('\n');
-        return m.reply(`**Top Players:**\n${top || 'No data yet.'}`);
+    if (c === '!play') {
+        const o = m.mentions.users.first(), g = new Chess();
+        sessions.set(id, { g, type: o ? 'pvp' : 'bot', oid: o?.id || 'Bot', t: Date.now() });
+        if (o) sessions.set(o.id, { g, type: 'pvp', oid: id, t: Date.now() });
+        return draw(m.channel, g, `Match: <@${id}> vs ${o ?? 'Bot'}`);
     }
 
-    // Command: !play (Bot or PvP)
-    if (cmd === '!play') {
-        const opponent = m.mentions.users.first();
-        const game = new Chess();
-        games.set(userId, { game, type: opponent ? 'pvp' : 'bot', opponentId: opponent?.id });
-        if (opponent) games.set(opponent.id, { game, type: 'pvp', opponentId: userId });
-        
-        return sendBoard(m.channel, game, `Game started! ${opponent ? `<@${opponent.id}>, your move.` : 'Your move vs Bot.'}`);
+    if (c === '!puzzle' || c === '!daily') {
+        const d = c === '!daily' ? (await (await fetch('https://lichess.org/api/puzzle/daily')).json()).puzzle : puz[Math.floor(Math.random() * puz.length)];
+        const g = new Chess(d.fen || d.f), sol = d.solution || d.s; g.move(sol[0]);
+        return sessions.set(id, { g, type: 'puz', sol, i: 1, t: Date.now() }), draw(m.channel, g, `Rating: ${d.rating || d.r}`);
     }
 
-    // Puzzle Mode
-    if (cmd === '!puzzle') {
-        const p = puzzles[Math.floor(Math.random() * puzzles.length)];
-        const game = new Chess(p.fen);
-        game.move(p.solution[0]); // Opponent's first move
-        games.set(userId, { game, type: 'puzzle', solution: p.solution, moveIndex: 1 });
-        return sendBoard(m.channel, game, `Puzzle Rating: ${p.rating}. Find the best move!`);
+    if (c === '!stats') {
+        const u = db[m.mentions.users.first()?.id || id] || {r:1500, w:0, l:0, h:[]};
+        return m.reply(`Elo: **${Math.round(u.r)}** | ${u.w}W-${u.l}L\nHistory: ${u.h.slice(-5).join(',')}`);
     }
 
-    // Handle Moves
-    const session = games.get(userId);
-    if (session && !m.content.startsWith('!')) {
-        const { game, type, solution, moveIndex } = session;
+    if (s && !m.content.startsWith('!')) {
         try {
-            const move = game.move(m.content);
-            if (!move) return;
-
-            if (type === 'puzzle') {
-                if (move.lan === solution[moveIndex]) {
-                    const nextIdx = moveIndex + 1;
-                    if (nextIdx >= solution.length) {
-                        updateScore(userId, true);
-                        games.delete(userId);
-                        return m.reply("Solved! 🎉");
-                    }
-                    game.move(solution[nextIdx]);
-                    session.moveIndex = nextIdx + 1;
-                    return sendBoard(m.channel, game, `Correct! Your turn again.`, userId);
-                } else {
-                    return m.reply("Wrong move. Try again!");
-                }
-            } else if (type === 'bot') {
-                if (game.isGameOver()) {
-                    updateScore(userId, !game.repetition);
-                    games.delete(userId);
-                    return m.reply("Game Over!");
-                }
-                game.move(getBotMove(game));
-                return sendBoard(m.channel, game, `Bot played. Your move!`);
-            } else if (type === 'pvp') {
-                const oppId = session.opponentId;
-                if (game.isGameOver()) {
-                    updateScore(userId, true); updateScore(oppId, false);
-                    games.delete(userId); games.delete(oppId);
-                    return m.reply("Checkmate!");
-                }
-                return sendBoard(m.channel, game, `Move played! <@${oppId}>, your turn.`);
+            const move = s.g.move(m.content); if (!move) return;
+            s.t = Date.now(); // Reset activity timer
+            if (s.type === 'puz') {
+                if (move.lan !== s.sol[s.i]) return m.reply("❌");
+                if (++s.i >= s.sol.length) return sessions.delete(id), m.reply("Solved! 🎉");
+                s.g.move(s.sol[s.i++]); return draw(m.channel, s.g, "Correct!");
             }
-        } catch (e) { /* Ignore invalid SAN/UCI strings */ }
+            if (s.g.isGameOver()) {
+                if (s.oid !== 'Bot') elo(id, s.oid, s.g.isDraw());
+                return sessions.delete(id), s.oid && sessions.delete(s.oid), m.reply(`GameOver! https://lichess.org/analysis/${s.g.fen()}`);
+            }
+            if (s.type === 'bot') s.g.move(s.g.moves().sort((a,b) => (s.g.move(b), s.g.undo(), 1))[0]);
+            return draw(m.channel, s.g, s.type === 'bot' ? "Bot move..." : `<@${s.oid}>'s turn`);
+        } catch(e) {}
     }
+    if (['!fen', '!pgn', '!help'].includes(c)) return m.reply(c === '!help' ? "Commands: `!play`, `!puzzle`, `!daily`, `!stats`, `!leaderboard`" : `\`${s?.g[c.slice(1)]()}\``);
 });
-
 client.login(process.env.BOT_TOKEN);
